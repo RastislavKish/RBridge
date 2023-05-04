@@ -14,11 +14,16 @@
 * along with this program. If not, see <https://www.gnu.org/licenses/>.
 */
 
+use std::collections::HashMap;
 use std::fs;
+use std::path::Path;
 
 use enigo::{Enigo, Key, KeyboardControllable};
 
 use futures_util::{SinkExt, StreamExt};
+
+use lazy_static::lazy_static;
+use regex::Regex;
 
 use serde::{Serialize, Deserialize};
 
@@ -348,6 +353,275 @@ impl Default for Scheme {
         }
     }
 
+#[derive(Clone)]
+pub struct BrailleSchemeManager {
+    schemes: Vec<BrailleScheme>,
+    }
+impl BrailleSchemeManager {
+
+    pub fn new() -> BrailleSchemeManager {
+        BrailleSchemeManager { schemes: vec![] }
+        }
+
+    pub fn from_directory(path: &str) -> Result<BrailleSchemeManager, String> {
+        let mut schemes: Vec<BrailleScheme>=Vec::new();
+
+        let path=Path::new(path);
+
+        if !path.exists() {
+            return Err(format!("Path {} doesn't exist", path.display()));
+            }
+
+        if !path.is_dir() {
+            return Err(format!("Path {} is not a directory", path.display()));
+            }
+
+        for entry in fs::read_dir(path).map_err(|e| e.to_string())? {
+            let entry=entry.map_err(|e| e.to_string())?;
+            let scheme_path=entry.path();
+
+            if scheme_path.is_dir() {
+                schemes.push(BrailleScheme::from_directory(&scheme_path.display().to_string())?);
+                }
+            }
+
+        Ok(BrailleSchemeManager { schemes })
+        }
+
+    pub fn switch_mapping(&mut self, switch_type: &SwitchType) -> Result<(), String> {
+        if self.schemes.len()==0 {
+            return Err(format!("no braille schemes"));
+            }
+
+        self.schemes[0].switch_mapping(switch_type)?;
+
+        Ok(())
+        }
+    pub fn translate_combination(&mut self, combination: usize) -> Option<Operation> {
+        if self.schemes.len()==0 {
+            return None;
+            }
+
+        self.schemes[0].translate_combination(combination)
+        }
+
+    pub fn current_mapping_name(&self) -> String {
+        if self.schemes.len()==0 {
+            return "".to_string();
+            }
+
+        self.schemes[0].current_mapping_name()
+        }
+
+    }
+
+#[derive(Clone)]
+pub struct BrailleScheme {
+    name: String,
+    mapping_stack: Vec<BrailleMappingStackLayer>,
+    mappings: HashMap<String, BrailleMapping>,
+    }
+impl BrailleScheme {
+
+    pub fn from_directory(path: &str) -> Result<BrailleScheme, String> {
+        //First, load the files of the scheme
+
+        let files=BrailleScheme::load_bsc_files(path)?;
+
+        let name=Path::new(path).file_name().unwrap().to_str().unwrap().to_string();
+
+        if !files.contains_key("default") {
+            return Err(format!("Braille scheme {} doesn't have a default scheme", name));
+            }
+
+        let mut mappings: HashMap<String, BrailleMapping>=HashMap::new();
+
+        for key in files.keys() {
+            let mapping=BrailleMapping::from_script(key, &files[key])?;
+
+            mappings.insert(key.to_string(), mapping);
+            }
+
+        let default_mapping=mappings["default"].clone();
+        let mapping_stack: Vec<BrailleMappingStackLayer>=vec![BrailleMappingStackLayer::new(default_mapping, false)];
+
+        Ok(BrailleScheme { name, mapping_stack, mappings })
+        }
+
+    pub fn switch_mapping(&mut self, switch_type: &SwitchType) -> Result<(), String> {
+        match switch_type {
+            SwitchType::Append(name) => {
+                if let Some(appended_mapping)=self.mappings.get(name) {
+                    let stack_layer=BrailleMappingStackLayer::new(appended_mapping.clone(), false);
+
+                    self.mapping_stack.push(stack_layer);
+                    }
+                else {
+                    return Err(format!("Mapping {} not found", &name));
+                    }
+                },
+            SwitchType::TemporaryAppend(name) => {
+                if let Some(appended_mapping)=self.mappings.get(name) {
+                    let stack_layer=BrailleMappingStackLayer::new(appended_mapping.clone(), true);
+
+                    self.mapping_stack.push(stack_layer);
+                    }
+                else {
+                    return Err(format!("Mapping {} not found", &name));
+                    }
+                },
+            SwitchType::Return => {
+                if self.mapping_stack.len()==1 {
+                    return Ok(());
+                    }
+
+                self.mapping_stack.pop();
+                },
+            SwitchType::Default => {
+                while self.mapping_stack.len()>1 {
+                    self.mapping_stack.pop();
+                    }
+                },
+            }
+
+        Ok(())
+        }
+    pub fn translate_combination(&mut self, combination: usize) -> Option<Operation> {
+        if self.mapping_stack.len()==0 {
+            return self.mapping_stack[0].mapping.get(combination);
+            }
+
+        let mapping_stack_layer=&self.mapping_stack.last().unwrap();
+
+        let result=mapping_stack_layer.mapping.get(combination);
+
+        if mapping_stack_layer.temporary {
+            drop(mapping_stack_layer);
+            self.mapping_stack.pop();
+            }
+
+        result
+        }
+
+    pub fn current_mapping_name(&self) -> String {
+        self.mapping_stack.last().unwrap().mapping.name()
+        }
+    pub fn name(&self) -> String {
+        self.name.clone()
+        }
+
+    fn load_bsc_files(path: &str) -> Result<HashMap<String, String>, String> {
+        let mut files: HashMap<String, String>=HashMap::new();
+
+        let path=Path::new(path);
+
+        if !path.exists() {
+            return Err(format!("Path {} doesn't exist", path.display()));
+            }
+
+        if !path.is_dir() {
+            return Err(format!("Path {} is not a directory", path.display()));
+            }
+
+        for entry in fs::read_dir(path).map_err(|e| e.to_string())? {
+            let entry=entry.map_err(|e| e.to_string())?;
+            let file_path=entry.path();
+
+            if file_path.is_file() && file_path.extension().map_or(false, |ext| ext=="bsc") {
+                let file_name=file_path.file_stem().and_then(|n| n.to_str()).unwrap_or("").to_string();
+                let file_content=fs::read_to_string(&file_path).map_err(|e| e.to_string())?;
+
+                files.insert(file_name, file_content);
+                }
+
+            }
+
+        Ok(files)
+        }
+    }
+
+#[derive(Clone)]
+pub struct BrailleMapping {
+    name: String,
+    mapping: Vec<Option<Operation>>,
+    }
+impl BrailleMapping {
+
+    pub fn new(name: &str) -> BrailleMapping {
+        BrailleMapping { name: name.to_string(), mapping: vec![None; 64] }
+        }
+
+    pub fn from_script(name: &str, script: &str) -> Result<BrailleMapping, String> {
+        let mut mapping=BrailleMapping::new(name);
+
+        lazy_static! {
+            static ref ASSIGNMENT_REGEX: Regex=Regex::new(r"^.*=([1-6]+)$").unwrap();
+            }
+
+        for line in script.lines() {
+            if line=="" {
+                continue;
+                }
+
+            if line.starts_with("//") {
+                continue;
+                }
+
+            if ASSIGNMENT_REGEX.is_match(line) {
+                let caps=ASSIGNMENT_REGEX.captures(line).unwrap();
+
+                let operation_string=caps.get(1).unwrap().as_str();
+                let combination_string=caps.get(2).unwrap().as_str();
+
+                let operation=Operation::from_str(operation_string);
+
+                let mut combination=0usize;
+
+                for digit_char in combination_string.chars() {
+                    let digit=digit_char.to_digit(10).unwrap() as usize;
+
+                    combination=combination | (2usize.pow((digit-1) as u32));
+                    }
+
+                mapping.set(combination, Some(operation));
+                }
+            else {
+                eprintln!("Warning: {}.bsc, invalid line \"{}\"", name, line);
+                }
+            }
+
+        Ok(mapping)
+        }
+
+    pub fn get(&self, combination: usize) -> Option<Operation> {
+        assert!(combination<=64);
+
+        self.mapping[combination].clone()
+        }
+    pub fn set(&mut self, combination: usize, operation: Option<Operation>) {
+        assert!(combination<=64);
+
+        self.mapping[combination]=operation;
+        }
+
+    pub fn name(&self) -> String {
+        self.name.clone()
+        }
+
+    }
+
+#[derive(Clone)]
+struct BrailleMappingStackLayer {
+    pub mapping: BrailleMapping,
+    pub temporary: bool,
+    }
+impl BrailleMappingStackLayer {
+
+    pub fn new(mapping: BrailleMapping, temporary: bool) -> BrailleMappingStackLayer {
+        BrailleMappingStackLayer { mapping, temporary }
+        }
+    }
+
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(default)]
 #[serde(rename_all(deserialize="camelCase"))]
@@ -356,11 +630,15 @@ struct Settings {
     commands: Vec<Command>,
     rings: Vec<Ring>,
     schemes: Vec<Scheme>,
+    #[serde(skip)]
+    braille_scheme_manager: BrailleSchemeManager,
     }
 impl Settings {
 
     fn new(actions: Vec<Action>, commands: Vec<Command>, rings: Vec<Ring>, schemes: Vec<Scheme>) -> Settings {
-        Settings { actions, commands, rings, schemes }
+        let braille_scheme_manager=BrailleSchemeManager::new();
+
+        Settings { actions, commands, rings, schemes, braille_scheme_manager }
         }
 
     fn from_json(json: &str) -> Result<Settings, String> {
@@ -388,6 +666,8 @@ impl Settings {
         for scheme in &mut self.schemes {
             scheme.finalize(&self.commands, &self.rings)?;
             }
+
+        self.braille_scheme_manager=BrailleSchemeManager::from_directory("braille_schemes")?;
 
         Ok(())
         }
@@ -521,13 +801,44 @@ enum SlotOperation {
     }
 
 #[derive(Clone, Debug)]
-enum Operation {
+pub enum Operation {
     Shortcut(bool, bool, bool, bool, bool, Key),
+    SchemeSwitch(SwitchType),
     None,
     }
 impl Operation {
 
     fn from_str(input: &str) -> Operation {
+        //First, check scheme switch since it's case sensitive
+
+        lazy_static! {
+            static ref SCHEME_SWITCH_OPERATION_REGEX: Regex=Regex::new(r"^(\&+)([^\&].*)$").unwrap();
+            }
+
+        if input.len()>1 {
+            if SCHEME_SWITCH_OPERATION_REGEX.is_match(input) {
+                let caps=SCHEME_SWITCH_OPERATION_REGEX.captures(input).unwrap();
+
+                let ampersants=caps.get(1).unwrap().as_str();
+                let switch_operation=caps.get(2).unwrap().as_str();
+
+                let switch_type=match &switch_operation[..] {
+                    "default" => SwitchType::Default,
+                    "return" => SwitchType::Return,
+                    scheme_name => {
+                        if ampersants.len()==1 {
+                            SwitchType::TemporaryAppend(scheme_name.to_string())
+                            }
+                        else {
+                            SwitchType::Append(scheme_name.to_string())
+                            }
+                        },
+                    };
+
+                return Operation::SchemeSwitch(switch_type);
+                }
+            }
+
         let processed_input=input.trim().to_string().to_lowercase();
 
         if processed_input=="" { return Operation::None; }
@@ -604,8 +915,24 @@ impl Operation {
     }
 
 #[derive(Clone, Debug)]
+pub enum SwitchType {
+    Append(String),
+    TemporaryAppend(String),
+    Return,
+    Default,
+    }
+
+#[derive(Clone, Debug)]
+enum InputMode {
+    Standard,
+    Braille,
+    }
+
+#[derive(Clone, Debug)]
 enum ClientMessage {
     Gesture(Gesture),
+    Braille(usize),
+    InputMode(InputMode),
     }
 impl ClientMessage {
 
@@ -655,6 +982,28 @@ impl ClientMessage {
                 let gesture=Gesture::new(finger_count, modifier_count, start_x, start_y, shape);
 
                 return Ok(ClientMessage::Gesture(gesture));
+                },
+            1 => { //Braille input
+                if bytes.len()!=2 {
+                    return Err(format!("Invalid byte count for a braille client message ({}).", bytes.len()));
+                    }
+
+                let combination=bytes[1] as usize;
+
+                return Ok(ClientMessage::Braille(combination));
+                },
+            2 => { //Input mode change
+                if bytes.len()!=2 {
+                    return Err(format!("Invalid byte count ({}) for an input mode client message.", bytes.len()));
+                    }
+
+                let input_mode=match bytes[1] {
+                    0 => InputMode::Standard,
+                    1 => InputMode::Braille,
+                    identifier => return Err(format!("Invalid input mode identifier ({}) in a client message", identifier)),
+                    };
+
+                return Ok(ClientMessage::InputMode(input_mode));
                 },
             identifier => return Err(format!("Unknown client message identifier {}.", identifier)),
             }
@@ -835,7 +1184,27 @@ impl Executor {
                 }
             }
         }
+    fn process_braille(&mut self, combination: usize) {
+        if let Some(operation)=self.settings.braille_scheme_manager.translate_combination(combination) {
+            if let Operation::SchemeSwitch(switch_type)=operation {
+                if let Err(e)=self.settings.braille_scheme_manager.switch_mapping(&switch_type) {
+                    self.execution_sender.send(e).unwrap();
+                    return;
+                    }
 
+                let current_mapping_name=self.settings.braille_scheme_manager.current_mapping_name();
+                self.execution_sender.send(current_mapping_name).unwrap();
+                return;
+                }
+
+            let id=-(combination as i32);
+
+            self.key_executor.execute(id, &operation, false, false, false);
+            }
+        }
+    fn process_input_mode(&mut self, _input_mode: InputMode) {
+
+        }
     }
 
 #[tokio::main]
@@ -908,6 +1277,8 @@ async fn execution_thread(mut communication_receiver: mpsc::Receiver<ClientMessa
     while let Some(client_message)=communication_receiver.recv().await {
         match client_message {
             ClientMessage::Gesture(gesture) => executor.process_gesture(&gesture),
+            ClientMessage::Braille(combination) => executor.process_braille(combination),
+            ClientMessage::InputMode(input_mode) => executor.process_input_mode(input_mode),
             }
         }
     }

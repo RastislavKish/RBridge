@@ -13,7 +13,7 @@ enigo="0.0.14"
 futures-util="0.3.27"
 lazy_static="1.4.0"
 local-ip-address="0.5.1"
-regex="1.4.3"
+regex="1.8.1"
 serde={version="1.0.140", features=["derive"]}
 serde_json="1.0.94"
 tokio = { version = "1.26.0", features = ["full"] }
